@@ -28,8 +28,12 @@ INCREASE_CONCURRENT_ON_FAILURE = int(os.environ.get("INCREASE_CONCURRENT_ON_FAIL
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "3"))  # 最大并发请求数
 
 # 缓存配置
-CACHE_EXPIRY_TIME = int(os.environ.get("CACHE_EXPIRY_TIME", "21600"))  # 默认缓存 6 小时 (21600 秒)
-MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "500"))  # 默认最多缓存500条响应
+CACHE_EXPIRY_TIME = int(os.environ.get("CACHE_EXPIRY_TIME", "3600"))  # 默认缓存 1 小时 (3600 秒)
+MAX_CACHE_ENTRIES = int(os.environ.get("MAX_CACHE_ENTRIES", "50"))  # 默认最多缓存50条响应
+MAX_CACHE_ITEM_SIZE_KB = int(os.environ.get("MAX_CACHE_ITEM_SIZE_KB", "128"))  # 单个缓存项最大容量 (KB)
+MAX_CACHE_ITEM_SIZE = MAX_CACHE_ITEM_SIZE_KB * 1024
+MAX_CACHE_SIZE_MB = int(os.environ.get("MAX_CACHE_SIZE_MB", "5"))  # 缓存总占用大小限制 (MB)
+MAX_CACHE_SIZE = MAX_CACHE_SIZE_MB * 1024 * 1024
 CALCULATE_CACHE_ENTRIES = int(os.environ.get("CALCULATE_CACHE_ENTRIES", "6"))  # 默认取最后 6 条消息算缓存键
 PRECISE_CACHE = os.environ.get("PRECISE_CACHE", "false").lower() in ["true", "1", "yes"] #是否取所有消息来算缓存键
 
