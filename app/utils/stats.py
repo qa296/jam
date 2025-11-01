@@ -22,12 +22,12 @@ class ApiStatsManager:
         self.model_tokens = Counter()    # 记录每个模型的token使用量
         self.api_model_tokens = defaultdict(Counter)  # 记录每个API密钥对每个模型的token使用量
         
-        # 用于时间序列分析的数据结构（最近24小时，按分钟分组）
+        # 用于时间序列分析的数据结构（最近1小时，按分钟分组）
         self.time_buckets = {}  # 格式: {timestamp_minute: {"calls": count, "tokens": count}}
         
         # 保存与兼容格式相关的调用日志（最小化存储）
         self.recent_calls = []  # 仅保存最近的少量调用，用于前端展示
-        self.max_recent_calls = 100  # 最大保存的最近调用记录数
+        self.max_recent_calls = 20  # 最大保存的最近调用记录数
         
         # 当前时间分钟桶的时间戳（分钟级别）
         self.current_minute = self._get_minute_timestamp(datetime.now())
@@ -99,6 +99,17 @@ class ApiStatsManager:
                 self.api_key_tokens[api_key] += tokens
                 self.model_tokens[model] += tokens
                 self.api_model_tokens[api_key][model] += tokens
+            
+            # 限制Counter大小，删除最少使用的项
+            if len(self.api_key_counts) > 100:
+                least_common = [k for k, v in self.api_key_counts.most_common()[-10:]]
+                for key in least_common:
+                    del self.api_key_counts[key]
+                    del self.api_key_tokens[key]
+                    if key in self.api_model_counts:
+                        del self.api_model_counts[key]
+                    if key in self.api_model_tokens:
+                        del self.api_model_tokens[key]
     
     async def update_stats(self, api_key, model, tokens=0):
         """更新API调用统计"""
@@ -145,14 +156,14 @@ class ApiStatsManager:
         log('info', log_message)
     
     async def cleanup(self):
-        """清理超过24小时的时间桶数据"""
+        """清理超过1小时的时间桶数据"""
         now = datetime.now()
-        day_ago_ts = self._get_minute_timestamp(now - timedelta(days=1))
+        hour_ago_ts = self._get_minute_timestamp(now - timedelta(hours=1))
         
         with self._time_series_lock:
             # 直接删除旧的时间桶
             for ts in list(self.time_buckets.keys()):
-                if ts < day_ago_ts:
+                if ts < hour_ago_ts:
                     del self.time_buckets[ts]
         
         self.last_cleanup = time.time()

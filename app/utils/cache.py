@@ -1,12 +1,13 @@
 import time
 import xxhash 
 import asyncio
+import sys
 from typing import Dict, Any, Optional, Tuple
 import logging
 from collections import deque
 from app.utils.logging import log
+import app.config.settings as settings
 logger = logging.getLogger("my_logger")
-import heapq
 
 # 定义缓存项的结构
 CacheItem = Dict[str, Any]
@@ -28,7 +29,37 @@ class ResponseCacheManager:
         self.expiry_time = expiry_time
         self.max_entries = max_entries # 总条目数限制
         self.cur_cache_num = 0 # 当前条目数
+        self.cur_cache_size = 0  # 当前缓存占用的总大小（字节）
+        self.max_total_size = settings.MAX_CACHE_SIZE  # 缓存总占用大小限制
         self.lock = asyncio.Lock() # Added lock
+
+    def _estimate_size(self, obj: Any, seen: Optional[set] = None) -> int:
+        """递归估算对象占用的内存大小"""
+        if seen is None:
+            seen = set()
+
+        obj_id = id(obj)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+
+        # 优先将 Pydantic 模型或具有 dict 能力的对象转成普通结构
+        try:
+            if hasattr(obj, "model_dump"):
+                obj = obj.model_dump()
+            elif hasattr(obj, "dict"):
+                obj = obj.dict()
+        except Exception:
+            pass
+
+        size = sys.getsizeof(obj)
+
+        if isinstance(obj, dict):
+            size += sum(self._estimate_size(k, seen) + self._estimate_size(v, seen) for k, v in obj.items())
+        elif isinstance(obj, (list, tuple, set, deque)):
+            size += sum(self._estimate_size(item, seen) for item in obj)
+
+        return size
 
     async def get(self, cache_key: str) -> Tuple[Optional[Any], bool]: # Made async
         """获取指定键的第一个有效缓存项（不删除）"""
@@ -56,6 +87,7 @@ class ResponseCacheManager:
                 response_to_return = None
                 new_deque = deque()
                 items_removed_count = 0
+                size_freed = 0
 
                 for item in cache_deque:
                     if now < item.get('expiry_time', 0):
@@ -63,15 +95,18 @@ class ResponseCacheManager:
                             valid_item_to_remove = item
                             response_to_return = item.get('response', None)
                             items_removed_count += 1 # 计数此项为移除
+                            size_freed += item.get('size', 0)
                             
                         else:
                             new_deque.append(item) # 保留后续有效项
                     else:
                         items_removed_count += 1 # 计数过期项为移除
+                        size_freed += item.get('size', 0)
 
                 # 更新缓存状态
                 if items_removed_count > 0:
                     self.cur_cache_num = max(0, self.cur_cache_num - items_removed_count)
+                    self.cur_cache_size = max(0, self.cur_cache_size - size_freed)
                     if not new_deque:
                         # 如果所有项都被移除（过期或我们取的那个）
                         del self.cache[cache_key]
@@ -86,45 +121,60 @@ class ResponseCacheManager:
 
     async def store(self, cache_key: str, response: Any):
         """存储响应到缓存（追加到键对应的deque）"""
+        
+        # 使用更精确的大小估算
+        response_size = self._estimate_size(response)
+        if response_size > settings.MAX_CACHE_ITEM_SIZE:
+            log('info', f"响应大小 {response_size} 字节超过限制 {settings.MAX_CACHE_ITEM_SIZE} 字节，跳过缓存")
+            return
+        
         now = time.time()
         new_item: CacheItem = {
             'response': response,
             'expiry_time': now + self.expiry_time,
             'created_at': now,
+            'size': response_size,
         }
 
-        needs_cleaning = False
+        needs_cleaning_count = False
+        needs_cleaning_size = False
         async with self.lock:
             if cache_key not in self.cache:
                 self.cache[cache_key] = deque()
             
             self.cache[cache_key].append(new_item) # 追加到deque末尾
             self.cur_cache_num += 1
-            needs_cleaning = self.cur_cache_num > self.max_entries
+            self.cur_cache_size += response_size
+            needs_cleaning_count = self.cur_cache_num > self.max_entries
+            needs_cleaning_size = self.cur_cache_size > self.max_total_size
 
-        if needs_cleaning:
+        if needs_cleaning_count or needs_cleaning_size:
              # 在锁外调用清理，避免长时间持有锁
              await self.clean_if_needed()
 
     async def clean_expired(self):
         """清理所有缓存项中已过期的项。"""
         now = time.time()
-        keys_to_remove = []
         total_cleaned = 0
+        total_size_freed = 0
         async with self.lock:
             # 迭代 cache 的副本以允许在循环中安全地修改 cache
             for key, cache_deque in list(self.cache.items()):
                 original_len = len(cache_deque)
                 # 创建一个新的 deque，只包含未过期的项
+                expired_items = [item for item in cache_deque if now >= item.get('expiry_time', 0)]
                 valid_items = deque(item for item in cache_deque if now < item.get('expiry_time', 0))
                 cleaned_count = original_len - len(valid_items)
 
                 if cleaned_count > 0:
+                    # 统计释放的内存大小
+                    for item in expired_items:
+                        total_size_freed += item.get('size', 0)
+                    
                     log('info', f"清理键 {key[:8]}... 的过期缓存项 {cleaned_count} 个。")
                     total_cleaned += cleaned_count
 
                 if not valid_items:
-                    keys_to_remove.append(key) # 标记此键以便稍后删除
                     # 在持有锁时直接删除键
                     if key in self.cache:
                          del self.cache[key]
@@ -136,53 +186,58 @@ class ResponseCacheManager:
             # 统一更新缓存计数
             if total_cleaned > 0:
                  self.cur_cache_num = max(0, self.cur_cache_num - total_cleaned)
+                 self.cur_cache_size = max(0, self.cur_cache_size - total_size_freed)
 
     async def clean_if_needed(self):
-        """如果缓存总条目数超过限制，清理全局最旧的项目。"""
+        """如果缓存总条目数或总大小超过限制，按时间顺序清理最旧的项目。"""
 
         async with self.lock: 
-            if self.cur_cache_num <= self.max_entries:
+            if self.cur_cache_num <= self.max_entries and self.cur_cache_size <= self.max_total_size:
                 return
-
-            # 计算目标大小和需要移除的数量
-            target_size = max(self.max_entries - 10, 10)
-            if self.cur_cache_num <= target_size:
-                return
-
-            items_to_remove_count = self.cur_cache_num - target_size
-            log('info', f"缓存总数 {self.cur_cache_num} 超过限制 {self.max_entries}，需要清理 {items_to_remove_count} 个")
 
             # 收集所有缓存项及其元数据
             all_items_meta = []
             for key, cache_deque in self.cache.items():
                 for item in cache_deque:
-                    all_items_meta.append({'key': key, 'created_at': item.get('created_at', 0), 'item': item})
+                    all_items_meta.append({
+                        'key': key,
+                        'created_at': item.get('created_at', 0),
+                        'item': item,
+                        'size': item.get('size', 0)
+                    })
 
-            # 找出最旧的 N 项
-            actual_remove_count = min(items_to_remove_count, len(all_items_meta))
-            if actual_remove_count <= 0:
-                return # 没有项目可移除或无需移除
+            if not all_items_meta:
+                return
 
-            items_to_remove = heapq.nsmallest(actual_remove_count, all_items_meta, key=lambda x: x['created_at'])
+            # 按创建时间从旧到新排序
+            all_items_meta.sort(key=lambda x: x['created_at'])
 
-            # 执行移除
             items_actually_removed = 0
+            size_freed = 0
             keys_potentially_empty = set()
-            for item_meta in items_to_remove:
+
+            for item_meta in all_items_meta:
+                if self.cur_cache_num <= self.max_entries and self.cur_cache_size <= self.max_total_size:
+                    break
+
                 key_to_clean = item_meta['key']
                 item_to_clean = item_meta['item']
+                item_size = item_meta['size']
 
                 if key_to_clean in self.cache:
                     try:
                         # 直接从 deque 中移除指定的 item 对象
                         self.cache[key_to_clean].remove(item_to_clean)
                         items_actually_removed += 1
-                        # 计数器在最后统一更新
+                        size_freed += item_size
+                        self.cur_cache_num = max(0, self.cur_cache_num - 1)
+                        self.cur_cache_size = max(0, self.cur_cache_size - item_size)
                         log('info', f"因容量限制，删除键 {key_to_clean[:8]}... 的旧缓存项 (创建于 {item_meta['created_at']})。")
-                        keys_potentially_empty.add(key_to_clean)
+                        if not self.cache[key_to_clean]:
+                            keys_potentially_empty.add(key_to_clean)
                     except (KeyError, ValueError):
                         log('warning', f"尝试因容量限制删除缓存项时未找到 (可能已被提前移除): {key_to_clean[:8]}...")
-                        pass
+                        continue
 
             # 检查是否有 deque 因本次清理变空
             for key in keys_potentially_empty:
@@ -190,10 +245,8 @@ class ResponseCacheManager:
                      del self.cache[key]
                      log('info', f"因容量限制清理后，键 {key[:8]}... 的deque已空，移除该键。")
 
-            # 统一更新缓存计数
-            if items_actually_removed > 0:
-                 self.cur_cache_num = max(0, self.cur_cache_num - items_actually_removed)
-                 log('info', f"因容量限制，共清理了 {items_actually_removed} 个旧缓存项。清理后缓存数: {self.cur_cache_num}")
+            if items_actually_removed > 0 or size_freed > 0:
+                 log('info', f"因容量限制，共清理了 {items_actually_removed} 个旧缓存项，释放 {size_freed} 字节。清理后缓存数: {self.cur_cache_num}，总大小: {self.cur_cache_size} 字节")
 
 def generate_cache_key(chat_request, last_n_messages: int = 65536, is_gemini=False) -> str:
     """

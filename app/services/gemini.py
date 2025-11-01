@@ -32,7 +32,6 @@ class GeminiResponseWrapper:
         self._total_token_count = self._extract_total_token_count()
         self._thoughts = self._extract_thoughts()
         self._function_call = self._extract_function_call()
-        self._json_dumps = json.dumps(self._data, indent=4, ensure_ascii=False)
         self._model = "gemini"
 
     def _extract_thoughts(self) -> Optional[str]:
@@ -122,10 +121,6 @@ class GeminiResponseWrapper:
     @property
     def thoughts(self) -> Optional[str]:
         return self._thoughts
-
-    @property
-    def json_dumps(self) -> str:
-        return self._json_dumps
 
     @property
     def model(self) -> str:

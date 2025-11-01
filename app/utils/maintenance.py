@@ -53,8 +53,8 @@ def schedule_cache_cleanup(response_cache_manager, active_requests_manager):
             # 确保关闭循环以释放资源
             loop.close()
     
-    # 添加同步的清理任务
-    scheduler.add_job(run_cleanup, 'interval', minutes=5)
+    # 添加同步的清理任务 - 更频繁地清理
+    scheduler.add_job(run_cleanup, 'interval', minutes=2)
     
     # 同样修改定时重置函数
     def run_reset():
